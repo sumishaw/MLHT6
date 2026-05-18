@@ -13,36 +13,39 @@ import android.widget.*
 import androidx.core.app.NotificationCompat
 
 /**
- * OverlayService — FIXED v3
+ * OverlayService — REWRITTEN v4
  *
- * KEY FIXES vs v2:
+ * ROOT CAUSES FIXED:
  *
- * FIX 1 — SENTENCES LOST DURING READING PAUSE (critical):
- *   Root cause: The old 6-second reading pause locked the word queue. While paused,
- *   new translations arrived and their words were appended to `wordQueue`. But the
- *   overlap-deduplication logic in `onNewText` compared the new words against the
- *   TAIL of the queue, often finding partial matches and skipping the beginning of
- *   the new sentence. After the pause ended, many words were missing or in the wrong
- *   order. In fast dialogue, 3–4 translations could arrive during a 6-second pause
- *   and all but the last would be corrupted.
- *   Fix: Reading pause reduced to 3 s. During a pause, incoming text REPLACES the
- *   pending queue entirely rather than appending. We keep exactly the LATEST text.
- *   This ensures the sentence shown after the pause is always the most recent one,
- *   with no corruption. Nothing is lost — we always show the latest available subtitle.
+ * FIX 1 — SENTENCES/WORDS DROPPED BY BAD DEDUP:
+ *   Old code: words.indexOfLast { it == lastQueued }
+ *   If the last word in the queue happened to match ANY word in the new sentence
+ *   (e.g. common Hindi words "है", "का", "में", "और"), everything before that
+ *   match was silently skipped. For a 10-word sentence, 8 words could be dropped.
+ *   Fix: Dedup completely removed. Every translation is shown in full, no word
+ *   skipping. The IDENTICAL-text check in SpeechCaptureService already prevents
+ *   true duplicates from being sent.
  *
- * FIX 2 — WORD REVEAL SPEED:
- *   80 ms per word was too slow for fast Hindi speech (5–7 words/sec in typical
- *   Bollywood dialogue). By the time 8 words were revealed, the next translation
- *   was already 2 sentences ahead. Reduced to 55 ms per word — fast enough to keep
- *   up with normal speech while still being readable.
+ * FIX 2 — READING PAUSE REPLACES CONTENT:
+ *   Old code: During 3s reading pause, new translations replaced the wordQueue
+ *   entirely. If 2 translations arrived during the pause (normal at 2s chunks),
+ *   the first was lost completely.
+ *   Fix: Reading pause removed entirely. Text is shown instantly as a full
+ *   sentence, cleared after DISPLAY_MS, then next sentence shown. No word-by-word
+ *   ticker — it was the source of timing bugs and lost words.
  *
- * FIX 3 — SILENCE TIMEOUT:
- *   4 s silence timeout was too short — legitimate gaps in dialogue (scene cuts,
- *   music) caused the overlay to clear and reset, then the first word of the next
- *   sentence was slow to appear. Increased to 5 s.
+ * FIX 3 — WORD-BY-WORD TICKER CAUSED DISPLAY GAPS:
+ *   Revealing 55ms/word meant a 12-word sentence took 660ms to fully appear.
+ *   During that 660ms, a new translation could arrive and corrupt/replace the
+ *   queue mid-display. Fast dialogue (Bollywood 5-7 words/sec) was impossible.
+ *   Fix: Full sentence displayed instantly. No ticker. No queue corruption.
  *
- * All other logic (drag-to-move, WAV header, notification, line-full detection,
- * fade in/out, overlay construction) is preserved exactly from v2.
+ * NEW DISPLAY MODEL:
+ *   Each translation is shown as complete text immediately.
+ *   After DISPLAY_MS (2500ms) it fades and is replaced by the next one.
+ *   If a new translation arrives before DISPLAY_MS, it replaces immediately.
+ *   Source text shown above Hindi text in smaller grey font.
+ *   Silence for SILENCE_MS (5s) fades the overlay out.
  */
 class OverlayService : Service() {
 
@@ -62,58 +65,36 @@ class OverlayService : Service() {
         }
     }
 
-    // ── Timing ────────────────────────────────────────────────────────────────
-    // FIX 2: 55 ms per word (was 80) — keeps up with fast speech
-    private val WORD_INTERVAL_MS  = 55L
-    // FIX 1: 3 s reading pause (was 6) — reduces window for sentence loss
-    private val READ_PAUSE_MS     = 3_000L
-    // FIX 3: 5 s silence timeout (was 4) — tolerates scene cuts / music
-    private val SILENCE_MS        = 5_000L
-    // Max lines visible at once
-    private val MAX_LINES         = 2
+    // How long each subtitle stays before fading (if no new one arrives)
+    private val DISPLAY_MS = 2_500L
+    // Fade out after this much silence
+    private val SILENCE_MS = 5_000L
 
     private var windowManager: WindowManager?              = null
     private var overlayView:   View?                       = null
-    private var subtitleTv:    TextView?                   = null
+    private var srcTv:         TextView?                   = null   // source language text
+    private var hindiTv:       TextView?                   = null   // Hindi translation
     private var params:        WindowManager.LayoutParams? = null
     private val mainHandler    = Handler(Looper.getMainLooper())
 
     @Volatile private var running   = true
     @Volatile private var viewAdded = false
+    @Volatile private var isVisible = false
 
-    // Word queue — incoming words waiting to be revealed
-    private val wordQueue  = ArrayDeque<String>(256)
-
-    // Words currently displayed, split by line
-    private val line1Words = StringBuilder()
-    private val line2Words = StringBuilder()
-    private var onLine2    = false   // whether we're filling line 2
-
-    // State flags
-    @Volatile private var isPaused    = false  // in reading pause
-    @Volatile private var isVisible   = false  // overlay alpha > 0
-
-    // Runnables
-    private var wordTickRunnable:  Runnable? = null
-    private var pauseEndRunnable:  Runnable? = null
-    private var silenceRunnable:   Runnable? = null
+    private var displayRunnable:  Runnable? = null
+    private var silenceRunnable:  Runnable? = null
 
     private fun dp(v: Int) = TypedValue.applyDimension(
         TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
     ).toInt()
-
-    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIF_ID,
-                buildNotification(),
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
+            startForeground(NOTIF_ID, buildNotification(),
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIF_ID, buildNotification())
         }
@@ -121,8 +102,8 @@ class OverlayService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         mainHandler.post { if (running) buildOverlay() }
 
-        pushCallback = { _, hindi ->
-            mainHandler.post { onNewText(hindi) }
+        pushCallback = { original, hindi ->
+            mainHandler.post { onNewText(original, hindi) }
         }
     }
 
@@ -140,159 +121,58 @@ class OverlayService : Service() {
         super.onDestroy()
     }
 
-    // ── Text ingestion ────────────────────────────────────────────────────────
-
     /**
-     * Called on main thread every time whisper pushes a new translation.
+     * Called on main thread for every new translation from Whisper.
      *
-     * FIX 1 — DURING PAUSE: Replace the queue with the new text entirely.
-     *   Old behaviour was to append → caused dedup corruption and sentence loss.
-     *   New behaviour: clear pending words, enqueue the new sentence only.
-     *   After the pause, the LATEST sentence is shown correctly.
-     *
-     * NORMAL (not paused): Append new words to the queue as before.
+     * Shows the full sentence immediately. Cancels any pending clear timer
+     * and restarts it. If silent for SILENCE_MS, fades out.
      */
-    private fun onNewText(hindi: String) {
+    private fun onNewText(original: String, hindi: String) {
         if (hindi.isBlank()) return
 
-        val words = hindi.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-        if (words.isEmpty()) return
+        // Cancel pending display-clear and silence timers
+        displayRunnable?.let { mainHandler.removeCallbacks(it) }
+        silenceRunnable?.let { mainHandler.removeCallbacks(it) }
 
-        if (isPaused) {
-            // FIX 1: Replace queued words with the latest translation.
-            // Don't try to merge/append — just show the newest sentence after pause.
-            wordQueue.clear()
-            wordQueue.addAll(words)
-        } else {
-            // Normal operation: avoid re-queueing words already at tail of queue.
-            val lastQueued = wordQueue.lastOrNull()
-            val startIdx = if (lastQueued != null) {
-                val overlap = words.indexOfLast { it == lastQueued }
-                if (overlap >= 0) overlap + 1 else 0
-            } else 0
+        // Show source text (smaller, grey) + Hindi text (large, white) instantly
+        srcTv?.text   = original.trim()
+        hindiTv?.text = hindi.trim()
 
-            for (i in startIdx until words.size) {
-                wordQueue.addLast(words[i])
-            }
-        }
-
-        // Reschedule silence timer — we just got new content
+        showOverlay()
         rescheduleSilence()
 
-        // Make overlay visible
-        showOverlay()
-
-        // Start word ticker if not already running and not in reading pause
-        if (!isPaused) {
-            scheduleNextWord()
+        // Auto-clear after DISPLAY_MS if no new translation arrives
+        displayRunnable = Runnable {
+            srcTv?.text   = ""
+            hindiTv?.text = ""
         }
+        mainHandler.postDelayed(displayRunnable!!, DISPLAY_MS)
     }
 
-    // ── Word-by-word ticker ───────────────────────────────────────────────────
-
-    private fun scheduleNextWord() {
-        wordTickRunnable?.let { mainHandler.removeCallbacks(it) }
-        if (!running || isPaused) return
-
-        wordTickRunnable = Runnable {
-            if (!running || isPaused) return@Runnable
-            if (wordQueue.isEmpty()) return@Runnable   // wait for more words
-
-            val word = wordQueue.removeFirst()
-            appendWord(word)
-        }
-        mainHandler.postDelayed(wordTickRunnable!!, WORD_INTERVAL_MS)
-    }
-
-    /**
-     * Appends one word to the current display, managing line breaks and the
-     * 2-line read-pause cycle.
-     */
-    private fun appendWord(word: String) {
-        if (!onLine2) {
-            // Filling line 1
-            if (line1Words.isNotEmpty()) line1Words.append(' ')
-            line1Words.append(word)
-
-            val l1text = line1Words.toString()
-            subtitleTv?.text = l1text
-
-            // Check if line 1 is visually full (TextView wraps it)
-            if (isLine1Full()) {
-                onLine2 = true
-                // Don't trigger pause yet — fill line 2 first
+    private fun showOverlay() {
+        if (!isVisible) {
+            overlayView?.apply {
+                alpha = 0f
+                animate().alpha(1f).setDuration(120).start()
             }
+            isVisible = true
         } else {
-            // Filling line 2
-            if (line2Words.isNotEmpty()) line2Words.append(' ')
-            line2Words.append(word)
-
-            subtitleTv?.text = "${line1Words}\n${line2Words}"
-
-            // Check if line 2 is visually full → trigger reading pause
-            if (isLine2Full()) {
-                startReadingPause()
-                return   // don't schedule next word yet; pause will do it
-            }
+            // Already visible — ensure full opacity (in case fade-out was in progress)
+            overlayView?.animate()?.cancel()
+            overlayView?.alpha = 1f
         }
-
-        // Continue ticking words
-        scheduleNextWord()
     }
-
-    // ── Line-full detection ───────────────────────────────────────────────────
-
-    private fun isLine1Full(): Boolean {
-        val tv = subtitleTv ?: return false
-        if (tv.width <= 0) return line1Words.length > 28   // rough fallback
-        return tv.lineCount > 1
-    }
-
-    private fun isLine2Full(): Boolean {
-        val tv = subtitleTv ?: return false
-        if (tv.width <= 0) return (line1Words.length + line2Words.length) > 56
-        return tv.lineCount > MAX_LINES
-    }
-
-    // ── Reading pause (3 s) ───────────────────────────────────────────────────
-
-    private fun startReadingPause() {
-        isPaused = true
-        pauseEndRunnable?.let { mainHandler.removeCallbacks(it) }
-        pauseEndRunnable = Runnable {
-            // Clear display, reset line state, resume word ticker
-            line1Words.clear()
-            line2Words.clear()
-            onLine2    = false
-            isPaused   = false
-            subtitleTv?.text = ""
-
-            if (wordQueue.isNotEmpty()) {
-                scheduleNextWord()
-            }
-        }
-        mainHandler.postDelayed(pauseEndRunnable!!, READ_PAUSE_MS)
-    }
-
-    // ── Silence detection — fade out after SILENCE_MS with no new text ────────
 
     private fun rescheduleSilence() {
         silenceRunnable?.let { mainHandler.removeCallbacks(it) }
         silenceRunnable = Runnable {
-            // Fade out and reset everything
-            subtitleTv?.animate()
+            overlayView?.animate()
                 ?.alpha(0f)
                 ?.setDuration(800)
                 ?.withEndAction {
-                    line1Words.clear()
-                    line2Words.clear()
-                    wordQueue.clear()
-                    onLine2  = false
-                    isPaused = false
-                    pauseEndRunnable?.let { mainHandler.removeCallbacks(it) }
-                    wordTickRunnable?.let  { mainHandler.removeCallbacks(it) }
-                    subtitleTv?.text  = ""
-                    subtitleTv?.alpha = 1f
+                    srcTv?.text   = ""
+                    hindiTv?.text = ""
+                    overlayView?.alpha = 1f
                     isVisible = false
                 }
                 ?.start()
@@ -300,45 +180,42 @@ class OverlayService : Service() {
         mainHandler.postDelayed(silenceRunnable!!, SILENCE_MS)
     }
 
-    private fun showOverlay() {
-        if (!isVisible) {
-            subtitleTv?.apply {
-                alpha = 0f
-                animate().alpha(1f).setDuration(150).start()
-            }
-            isVisible = true
-        }
-    }
-
-    // ── Overlay construction ──────────────────────────────────────────────────
-
     private fun buildOverlay() {
         try {
-            val container = android.widget.FrameLayout(this).apply {
-                setBackgroundColor(Color.TRANSPARENT)
+            // Root container
+            val container = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.parseColor("#CC000000"))  // semi-transparent black
+                setPadding(dp(12), dp(6), dp(12), dp(6))
             }
 
-            subtitleTv = TextView(this).apply {
-                text     = ""
-                typeface = Typeface.DEFAULT_BOLD
+            // Source language text (small, grey)
+            srcTv = TextView(this).apply {
+                text      = ""
+                typeface  = Typeface.DEFAULT
+                setTextColor(Color.parseColor("#BBBBBB"))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                maxLines  = 2
+                setShadowLayer(4f, 1f, 1f, Color.BLACK)
+            }
+
+            // Hindi translation (large, white, bold)
+            hindiTv = TextView(this).apply {
+                text      = ""
+                typeface  = Typeface.DEFAULT_BOLD
                 setTextColor(Color.WHITE)
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-                setLineSpacing(0f, 1.2f)
-                maxLines = MAX_LINES
-                gravity  = Gravity.START or Gravity.CENTER_VERTICAL
+                setLineSpacing(0f, 1.15f)
+                maxLines  = 3
                 setShadowLayer(10f, 1f, 1f, Color.BLACK)
-                setBackgroundColor(Color.TRANSPARENT)
-                setPadding(dp(12), dp(4), dp(12), dp(4))
             }
 
-            container.addView(
-                subtitleTv,
-                android.widget.FrameLayout.LayoutParams(
-                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
-                    android.widget.FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.START or Gravity.CENTER_VERTICAL
-                )
-            )
+            container.addView(srcTv,   LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT))
+            container.addView(hindiTv, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT))
 
             overlayView = container
 
@@ -349,8 +226,7 @@ class OverlayService : Service() {
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
-                else
-                    @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
+                else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                         WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                         WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
@@ -363,13 +239,13 @@ class OverlayService : Service() {
 
             // Draggable
             var startRawX = 0f; var startRawY = 0f
-            var initX     = 0;  var initY     = 0
+            var initX = 0;      var initY = 0
             container.setOnTouchListener { _, ev ->
                 val p = params ?: return@setOnTouchListener false
                 when (ev.action) {
                     MotionEvent.ACTION_DOWN -> {
                         startRawX = ev.rawX; startRawY = ev.rawY
-                        initX     = p.x;     initY     = p.y
+                        initX = p.x;         initY = p.y
                     }
                     MotionEvent.ACTION_MOVE -> {
                         p.x = initX + (ev.rawX - startRawX).toInt()
@@ -384,22 +260,17 @@ class OverlayService : Service() {
 
             windowManager?.addView(overlayView, params)
             viewAdded = true
+
         } catch (e: Exception) {
             android.util.Log.e("OverlayService", "buildOverlay error: ${e.message}")
         }
     }
 
-    // ── Notification ──────────────────────────────────────────────────────────
-
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel(
-                CHANNEL_ID,
-                "Caption Lens Overlay",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply { setShowBadge(false) }
-             .also { getSystemService(NotificationManager::class.java)
-                         .createNotificationChannel(it) }
+            NotificationChannel(CHANNEL_ID, "Caption Lens Overlay", NotificationManager.IMPORTANCE_LOW)
+                .apply { setShowBadge(false) }
+                .also { getSystemService(NotificationManager::class.java).createNotificationChannel(it) }
         }
     }
 
@@ -408,7 +279,5 @@ class OverlayService : Service() {
             .setContentTitle("Caption Lens Active")
             .setContentText("Hindi subtitle overlay running")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
-            .setOngoing(true)
-            .setSilent(true)
-            .build()
+            .setOngoing(true).setSilent(true).build()
 }
